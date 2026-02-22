@@ -27,16 +27,16 @@ class HandTracker:
         base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
-            num_hands=1,
+            num_hands=2,
             min_hand_detection_confidence=0.7,
             min_tracking_confidence=0.7
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
         
-        # State for EMA smoothing
-        self.prev_x = None
-        self.prev_y = None
-        self.prev_scale = None
+        # State for EMA smoothing (per hand)
+        self.prev_x = {"Left": None, "Right": None}
+        self.prev_y = {"Left": None, "Right": None}
+        self.prev_scale = {"Left": None, "Right": None}
     
     def _is_palm_open(self, landmarks):
         """Check if the hand is open by comparing 3D distance from wrist to fingertips vs PIP joints.
@@ -86,109 +86,128 @@ class HandTracker:
         return is_upright, palm_facing_camera
 
     def get_anchor_point(self, frame_rgb):
-        """Returns (centroid_x, centroid_y, hand_span) or None."""
-        # Convert the frame to a MediaPipe Image
+        """Returns a list of tracking data for each detected hand: 
+           [(anchor, scale_multiplier, pose_type, landmarks, is_firing, speed, handedness), ...]"""
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        
-        # Detect hands
         results = self.detector.detect(mp_image)
 
-        # No hand detected
+        # Clear state for lost hands
+        detected_hands = []
+        if results.handedness:
+            detected_hands = [h[0].category_name for h in results.handedness]
+            
+        for h_label in ["Left", "Right"]:
+            if h_label not in detected_hands:
+                self.prev_x[h_label] = None
+                self.prev_y[h_label] = None
+                self.prev_scale[h_label] = None
+
         if not results.hand_landmarks:
-            self.prev_x = self.prev_y = self.prev_scale = None
-            return None
+            return []
         
-        hand_landmarks = results.hand_landmarks[0]
-
-        # Indices: 5 (Index), 9 (Middle), 13 (Ring), 17 (Pinky)
-        knuckles = [5, 9, 13, 17]
-
+        tracking_list = []
         h, w, _ = frame_rgb.shape
-        sum_x, sum_y = 0, 0
-        min_x, max_x = float('inf'), float('-inf')
-        min_y, max_y = float('inf'), float('-inf')
 
-        for idx in knuckles:
-            lm = hand_landmarks[idx]
-            px, py = lm.x * w, lm.y * h
-            sum_x += px
-            sum_y += py
-            min_x, max_x = min(min_x, px), max(max_x, px)
-            min_y, max_y = min(min_y, py), max(max_y, py)
-        
-        centroid_x = int(sum_x / 4)
-        centroid_y = int(sum_y / 4)
+        for i, hand_landmarks in enumerate(results.hand_landmarks):
+            handedness = results.handedness[i][0].category_name
+            
+            knuckles = [5, 9, 13, 17]
+            sum_x, sum_y = 0, 0
+            for idx in knuckles:
+                lm = hand_landmarks[idx]
+                sum_x += lm.x * w
+                sum_y += lm.y * h
+            
+            centroid_x = int(sum_x / 4)
+            centroid_y = int(sum_y / 4)
 
-        thumb = hand_landmarks[4]
-        pinky = hand_landmarks[20]
-        thumb_x, thumb_y = thumb.x * w, thumb.y * h
-        pinky_x, pinky_y = pinky.x * w, pinky.y * h
+            thumb = hand_landmarks[4]
+            pinky = hand_landmarks[20]
+            thumb_x, thumb_y = thumb.x * w, thumb.y * h
+            pinky_x, pinky_y = pinky.x * w, pinky.y * h
 
-        spread_pixels = math.sqrt((pinky_x - thumb_x)**2 + (pinky_y - thumb_y)**2)
-        scale_multiplier = spread_pixels / 150
-        handedness = results.handedness[0][0].category_name
+            spread_pixels = math.sqrt((pinky_x - thumb_x)**2 + (pinky_y - thumb_y)**2)
+            scale_multiplier = spread_pixels / 150
 
-        is_upright, palm_facing_camera = self._is_hand_upright(hand_landmarks, handedness)
-        
-        # If the hand is upright but the palm is facing you, don't show any shape
-        if is_upright and not palm_facing_camera:
-            self.prev_x = self.prev_y = self.prev_scale = None
-            return None
-
-        handedness_label = "Right"
-        if results.handedness and len(results.handedness) > 0:
-            handedness_label = results.handedness[0][0].category_name
-        
-        # Default state: Hand is closed or resting (Glove only, no weapons)
-        pose_type = "NONE" 
-        
-        # Only check for weapons IF the palm is open
-        if self._is_palm_open(hand_landmarks):
-            is_upright, palm_facing_camera = self._is_hand_upright(hand_landmarks, handedness_label)
-            if is_upright and palm_facing_camera:
-                pose_type = "REPULSOR"
-            elif is_upright and not palm_facing_camera:
-                pose_type = "NONE"
+            pose_type = "NONE" 
+            
+            if not self._is_palm_open(hand_landmarks):
+                # Shield: closed fists facing camera or knuckles pointing to camera
+                wrist = hand_landmarks[0]
+                index_mcp = hand_landmarks[5]
+                pinky_mcp = hand_landmarks[17]
+                
+                # Z depth to see if knuckles are pointed at the camera (-Z is closer to camera)
+                knuckles_forward = index_mcp.z < -0.015
+                
+                # Check 2D orientation to see if back of hand faces camera
+                v1 = (index_mcp.x - wrist.x, index_mcp.y - wrist.y)
+                v2 = (pinky_mcp.x - wrist.x, pinky_mcp.y - wrist.y)
+                cross = v1[0] * v2[1] - v1[1] * v2[0]
+                is_back_facing = (cross < 0) if handedness == "Left" else (cross > 0)
+                
+                if is_back_facing or knuckles_forward:
+                    pose_type = "SHIELD"
             else:
-                pose_type = "DIAMOND"
+                    is_upright, palm_facing_camera = self._is_hand_upright(hand_landmarks, handedness)
+                    # Repulsor works on both hands (open palm facing camera)
+                    if is_upright and palm_facing_camera:
+                        pose_type = "REPULSOR"
+                    elif is_upright and not palm_facing_camera:
+                        pose_type = "NONE"
+                    else:
+                        pose_type = "DIAMOND"
 
-        # --- THE ANCHOR TARGETS ---
-        if pose_type == "REPULSOR":
-            wrist = hand_landmarks[0]
-            wrist_x, wrist_y = wrist.x * w, wrist.y * h
-            target_x = int(centroid_x * 0.7 + wrist_x * 0.3)
-            target_y = int(centroid_y * 0.7 + wrist_y * 0.3)
-        elif pose_type == "DIAMOND":
-            hover_offset = int(spread_pixels * HOLOGRAM_HOVER_MULTIPLIER)
-            target_x = centroid_x
-            target_y = centroid_y - hover_offset
-        else:
-            # If state is "NONE", just lock the invisible anchor to the knuckles
-            target_x = centroid_x
-            target_y = centroid_y
-
-        # Apply Exponential Moving Average (EMA) for smoothing
-        is_firing = False
-        speed = 0.0
-        if self.prev_x is None:
-            self.prev_x = target_x
-            self.prev_y = target_y
-            self.prev_scale = scale_multiplier
-        else:
-            # Thrust detection: check raw change before smoothing
-            dx = target_x - self.prev_x
-            dy = target_y - self.prev_y
-            speed = math.sqrt(dx**2 + dy**2)
-            d_scale = scale_multiplier - self.prev_scale
-            
+            # --- THE ANCHOR TARGETS ---
             if pose_type == "REPULSOR":
-                if d_scale > 0.15:
-                    is_firing = "CAMERA"
-                elif speed > 50:
-                    is_firing = "TARGET"
+                wrist = hand_landmarks[0]
+                wrist_x, wrist_y = wrist.x * w, wrist.y * h
+                target_x = int(centroid_x * 0.7 + wrist_x * 0.3)
+                target_y = int(centroid_y * 0.7 + wrist_y * 0.3)
+            elif pose_type == "DIAMOND":
+                hover_offset = int(spread_pixels * HOLOGRAM_HOVER_MULTIPLIER)
+                target_x = centroid_x
+                target_y = centroid_y - hover_offset
+            elif pose_type == "SHIELD":
+                # Shield centers around the fist centroid
+                target_x = centroid_x
+                target_y = centroid_y
+            else:
+                target_x = centroid_x
+                target_y = centroid_y
+
+            # Apply Exponential Moving Average (EMA) for smoothing
+            is_firing = False
+            speed = 0.0
             
-            self.prev_x = int(EMA_ALPHA * target_x + (1 - EMA_ALPHA) * self.prev_x)
-            self.prev_y = int(EMA_ALPHA * target_y + (1 - EMA_ALPHA) * self.prev_y)
-            self.prev_scale = EMA_ALPHA * scale_multiplier + (1 - EMA_ALPHA) * self.prev_scale
-        
-        return (self.prev_x, self.prev_y), self.prev_scale, pose_type, hand_landmarks, is_firing, speed
+            if self.prev_x[handedness] is None:
+                self.prev_x[handedness] = target_x
+                self.prev_y[handedness] = target_y
+                self.prev_scale[handedness] = scale_multiplier
+            else:
+                dx = target_x - self.prev_x[handedness]
+                dy = target_y - self.prev_y[handedness]
+                speed = math.sqrt(dx**2 + dy**2)
+                d_scale = scale_multiplier - self.prev_scale[handedness]
+                
+                if pose_type == "REPULSOR":
+                    if d_scale > 0.15:
+                        is_firing = "CAMERA"
+                    elif speed > 50:
+                        is_firing = "TARGET"
+                
+                self.prev_x[handedness] = int(EMA_ALPHA * target_x + (1 - EMA_ALPHA) * self.prev_x[handedness])
+                self.prev_y[handedness] = int(EMA_ALPHA * target_y + (1 - EMA_ALPHA) * self.prev_y[handedness])
+                self.prev_scale[handedness] = EMA_ALPHA * scale_multiplier + (1 - EMA_ALPHA) * self.prev_scale[handedness]
+            
+            tracking_list.append(
+                ((self.prev_x[handedness], self.prev_y[handedness]), 
+                 self.prev_scale[handedness], 
+                 pose_type, 
+                 hand_landmarks, 
+                 is_firing, 
+                 speed, 
+                 handedness)
+            )
+            
+        return tracking_list

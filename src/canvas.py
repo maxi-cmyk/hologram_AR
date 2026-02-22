@@ -206,6 +206,9 @@ class ARCanvas:
         self.cooldown_until = 0.0   # Timestamp to pause drawing
         self.explosions = []        # Array of active particle systems
         self.beams = []             # Active repulsor beams
+        self.scaling_shape = None
+        self.initial_pinch_dist = 0.0
+        self.initial_shape_size = 0.0
 
     def render_shapes(self, frame):
         # 1. RENDER LOOP (Painter's Algorithm)
@@ -226,7 +229,7 @@ class ARCanvas:
                 active_beams.append(beam)
         self.beams = active_beams
 
-    def process_interactions(self, frame, hand_landmarks):
+    def process_interactions(self, frame, hand_landmarks, allow_drawing=True):
         h, w, _ = frame.shape
         index_tip = hand_landmarks[8]
         thumb_tip = hand_landmarks[4]
@@ -285,7 +288,7 @@ class ARCanvas:
                     return # Exit to prevent drawing lines
 
         # 4. DRAWING MODE (With your custom auto-close physics)
-        if is_pinching:
+        if is_pinching and allow_drawing:
             if not self.is_drawing:
                 self.is_drawing = True
             
@@ -336,8 +339,11 @@ class ARCanvas:
                     if new_shape:
                         self.spawned_shapes.append(new_shape)
                         self.stroke_path = [] # Clear memory only on success!
+                        return True
 
         # 5. Render the live stroke
         if len(self.stroke_path) > 1:
             for i in range(1, len(self.stroke_path)):
                 cv2.line(frame, self.stroke_path[i-1], self.stroke_path[i], (255, 0, 255), 4)
+
+        return False
