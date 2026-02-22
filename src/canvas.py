@@ -77,7 +77,7 @@ class RepulsorBlast:
     def draw(self, frame):
         self.life -= 15
         if self.life > 0:
-            # Flash the screen/camera!
+            # Flash the screen/camera
             radius = int((1.0 - self.life / 255.0) * 800)
             thickness = max(1, int((self.life / 255.0) * 150))
             if thickness > 0:
@@ -206,6 +206,8 @@ class ARCanvas:
         self.cooldown_until = 0.0   # Timestamp to pause drawing
         self.explosions = []        # Array of active particle systems
         self.beams = []             # Active repulsor beams
+        self.drones = []            # Active enemy drones
+        self.enemy_lasers = []      # Enemy projectiles
         self.scaling_shape = None
         self.initial_pinch_dist = 0.0
         self.initial_shape_size = 0.0
@@ -228,6 +230,27 @@ class ARCanvas:
             if beam.draw(frame):
                 active_beams.append(beam)
         self.beams = active_beams
+        
+        # Draw drones
+        h, w, _ = frame.shape
+        active_drones = []
+        for drone in self.drones:
+            drone.update(w, h)
+            if drone.draw(frame):
+                active_drones.append(drone)
+                # Randomly fire lasers from drones
+                laser = drone.fire_laser(w, h)
+                if laser:
+                    self.enemy_lasers.append(laser)
+        self.drones = active_drones
+        
+        # Draw Enemy Lasers
+        active_lasers = []
+        for laser in self.enemy_lasers:
+            laser.update()
+            if laser.draw(frame):
+                active_lasers.append(laser)
+        self.enemy_lasers = active_lasers
 
     def process_interactions(self, frame, hand_landmarks, allow_drawing=True):
         h, w, _ = frame.shape

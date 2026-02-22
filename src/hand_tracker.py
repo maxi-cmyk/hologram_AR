@@ -8,6 +8,9 @@ import math
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
 
+POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+POSE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_lite.task")
+
 #constant float to control how high holograms float above the hand
 #increase this value to make shapes float higher
 HOLOGRAM_HOVER_MULTIPLIER = 1.5
@@ -16,27 +19,43 @@ HOLOGRAM_HOVER_MULTIPLIER = 1.5
 #lower = smoother but more lag. Higher = faster but more jitter. (Range: 0.0 - 1.0)
 EMA_ALPHA = 0.5
 
-class HandTracker:
+class HologramTracker:
     def __init__(self):
-        #download model if not present
+        #download models if not present
         if not os.path.exists(MODEL_PATH):
             print("Downloading hand landmarker model...")
             urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
             print("Download complete.")
 
-        base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
-        options = vision.HandLandmarkerOptions(
-            base_options=base_options,
+        if not os.path.exists(POSE_MODEL_PATH):
+            print("Downloading pose landmarker model...")
+            urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
+            print("Download complete.")
+
+        # Initialize Hand Landmarker
+        hand_base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+        hand_options = vision.HandLandmarkerOptions(
+            base_options=hand_base_options,
             num_hands=2,
             min_hand_detection_confidence=0.7,
             min_tracking_confidence=0.7
         )
-        self.detector = vision.HandLandmarker.create_from_options(options)
+        self.hand_detector = vision.HandLandmarker.create_from_options(hand_options)
+
+        # Initialize Pose Landmarker
+        pose_base_options = python.BaseOptions(model_asset_path=POSE_MODEL_PATH)
+        pose_options = vision.PoseLandmarkerOptions(
+            base_options=pose_base_options,
+            min_pose_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.pose_detector = vision.PoseLandmarker.create_from_options(pose_options)
         
         # State for EMA smoothing (per hand)
         self.prev_x = {"Left": None, "Right": None}
         self.prev_y = {"Left": None, "Right": None}
         self.prev_scale = {"Left": None, "Right": None}
+
     
     def _is_palm_open(self, landmarks):
         """Check if the hand is open by comparing 3D distance from wrist to fingertips vs PIP joints.
@@ -89,7 +108,7 @@ class HandTracker:
         """Returns a list of tracking data for each detected hand: 
            [(anchor, scale_multiplier, pose_type, landmarks, is_firing, speed, handedness), ...]"""
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        results = self.detector.detect(mp_image)
+        results = self.hand_detector.detect(mp_image)
 
         # Clear state for lost hands
         detected_hands = []
@@ -211,3 +230,27 @@ class HandTracker:
             )
             
         return tracking_list
+
+    def get_pose_data(self, frame_rgb):
+        """Returns the approximate chest position based on shoulder landmarks."""
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        results = self.pose_detector.detect(mp_image)
+        
+        if not results.pose_landmarks:
+            return None
+            
+        h, w, _ = frame_rgb.shape
+        # Landmark 11: Left Shoulder, 12: Right Shoulder
+        pose_landmarks = results.pose_landmarks[0]
+        l_shoulder = pose_landmarks[11]
+        r_shoulder = pose_landmarks[12]
+        
+        # Calculate midpoint
+        mid_x = (l_shoulder.x + r_shoulder.x) / 2
+        mid_y = (l_shoulder.y + r_shoulder.y) / 2
+        
+        # Offset down slightly to reach the center of the chest
+        chest_x = int(mid_x * w)
+        chest_y = int((mid_y + 0.15) * h) # 15% of height downward shift
+        
+        return (chest_x, chest_y)
