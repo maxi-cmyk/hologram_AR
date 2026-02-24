@@ -56,6 +56,29 @@ class HologramTracker:
         self.prev_y = {"Left": None, "Right": None}
         self.prev_scale = {"Left": None, "Right": None}
 
+    def _is_thumbs_up(self, landmarks):
+        """Check if the hand is doing a thumbs-up: thumb extended, all 4 fingers curled."""
+        wrist = landmarks[0]
+        
+        # Check thumb is extended (tip further from wrist than IP joint)
+        thumb_tip_dist = math.sqrt((landmarks[4].x - wrist.x)**2 + (landmarks[4].y - wrist.y)**2 + (landmarks[4].z - wrist.z)**2)
+        thumb_ip_dist = math.sqrt((landmarks[3].x - wrist.x)**2 + (landmarks[3].y - wrist.y)**2 + (landmarks[3].z - wrist.z)**2)
+        thumb_extended = thumb_tip_dist > thumb_ip_dist
+        
+        # Check 4 fingers are curled
+        fingers = [(8, 6), (12, 10), (16, 14), (20, 18)]
+        curled = 0
+        for tip, pip in fingers:
+            dist_tip = math.sqrt((landmarks[tip].x - wrist.x)**2 + (landmarks[tip].y - wrist.y)**2 + (landmarks[tip].z - wrist.z)**2)
+            dist_pip = math.sqrt((landmarks[pip].x - wrist.x)**2 + (landmarks[pip].y - wrist.y)**2 + (landmarks[pip].z - wrist.z)**2)
+            if dist_tip < dist_pip:
+                curled += 1
+        
+        # Thumb must point upward (tip Y < IP Y in normalized coords)
+        thumb_pointing_up = landmarks[4].y < landmarks[3].y
+        
+        return thumb_extended and curled >= 3 and thumb_pointing_up
+
     
     def _is_palm_open(self, landmarks):
         """Check if the hand is open by comparing 3D distance from wrist to fingertips vs PIP joints.

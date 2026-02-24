@@ -22,7 +22,7 @@ class HologramDiamond:
     
     def draw(self, frame, anchor, scale_multiplier=1.0):
         #rotating, scaling 3D vertices onto 2D frame
-        self.angle += 0.05
+        self.angle += 0.15
         angle_x = self.angle * 0.7
         angle_y = self.angle * 1.0
         angle_z = self.angle * 1.3
@@ -66,7 +66,3 @@ class HologramDiamond:
             
             #draw a bright cyan line between the two projected vertices
             cv2.line(frame, pt1, pt2, (255, 255, 0), 2)
-            
-
-
-

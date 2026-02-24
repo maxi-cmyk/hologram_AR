@@ -2,18 +2,19 @@ import cv2
 import time
 import math
 import random
+import os
 import numpy as np
 from PIL import Image, ImageFont, ImageDraw
 from hand_tracker import HologramTracker
 from diamond import HologramDiamond
-from repulsor import Repulsor
-from exoskeleton import Exoskeleton
-from shield import EnergyShield
+from weapons.repulsor import Repulsor
+from weapons.exoskeleton import Exoskeleton
+from weapons.shield import EnergyShield
 from canvas import ARCanvas, Explosion, RepulsorBlast
 from audio_manager import AudioManager
-from gamemode.game import GameManager, Drone, EnemyLaser
+from gamemode.game import GameManager, Drone
 from scaling import process_scaling
-from unibeam import ArcReactor, UnibeamBlast
+from armor_themes import ThemeManager
 
 def draw_target_brackets(frame, center, size=30, color=(255, 255, 0), thickness=2):
     x, y = center
@@ -40,10 +41,11 @@ def main():
     shield = EnergyShield()
     canvas = ARCanvas()
     audio = AudioManager()
+    theme_mgr = ThemeManager()
 
     try:
-        hud_font = ImageFont.truetype("assets/fonts/Orbitron.ttf", 24)
-        title_font = ImageFont.truetype("assets/fonts/Orbitron.ttf", 32)
+        hud_font = ImageFont.truetype("assets/fonts/Orbitron.ttf", 30)
+        title_font = ImageFont.truetype("assets/fonts/Orbitron.ttf", 40)
     except IOError:
         print("Font not found, using default OpenCV font")
         hud_font = None
@@ -53,18 +55,15 @@ def main():
     scale_mode = False
     game = GameManager()
     
-    arc_reactor = ArcReactor(0, 0)
-    unibeam_blasts = []
-    wrists_crossed = False
-    unibeam_charging = False
-    unibeam_charge_start_time = 0.0
-    u_status, u_color = "STANDBY", (100, 100, 0) # Unibeam Status
-    unibeam_cooldown_until = 0.0
-    
     repulsor_cooldown_until = {"Left": 0.0, "Right": 0.0}
     firing_armed = {"Left": False, "Right": False} # Prevent misfires on pose entry
     prev_pose = {"Left": "NONE", "Right": "NONE"} # Track pose changes
     pending_fire_start = {"Left": 0.0, "Right": 0.0} # Time when thrust was initiated
+    
+    # Screenshot System
+    screenshot_countdown_start = 0.0
+    screenshot_active = False
+    screenshot_cooldown_until = 0.0
     
     print("--- AR INTERACTIVE HOLOGRAM BOOTING ---")
     print("1. Show your open palm to the camera.")
@@ -115,23 +114,8 @@ def main():
             frame, tracking_data, scale_mode, canvas, sm_status, sm_color
         )
 
-        is_crossed_now = False # Default state
         #draw the anchor if it exists
         if tracking_data:
-            # --- PRE-LOOP GESTURE DETECTION (UNIBEAM) ---
-            if len(tracking_data) == 2:
-                left_wrist, right_wrist = None, None
-                for hand_data in tracking_data:
-                    handedness = hand_data[6]
-                    if handedness == "Left":
-                        left_wrist = hand_data[3][0]
-                    else:
-                        right_wrist = hand_data[3][0]
-                
-                if left_wrist and right_wrist:
-                    if left_wrist.x > right_wrist.x:
-                        is_crossed_now = True
-
             any_repulsor_active = False
             for hand_data in tracking_data:
                 anchor, scale_multiplier, pose_type, landmarks, is_firing, speed, handedness = hand_data
@@ -142,20 +126,25 @@ def main():
                 prev_pose[handedness] = pose_type
 
                 # Always draw the Exoskeleton, regardless of mode or pose
-                glove.draw(frame, landmarks)
+                glove.draw(frame, landmarks, theme=theme_mgr.get())
 
                 if draw_mode:
                     # Route raw landmarks into the Canvas
                     canvas.process_interactions(frame, landmarks)
+                    # Clear weapon state so nothing carries over
+                    pending_fire_start[handedness] = 0.0
+                    firing_armed[handedness] = False
                 elif scale_mode:
                     # Suspend weapons and drawing, but allow grabbing/moving shapes
                     if not is_dual_scaling:
                         canvas.process_interactions(frame, landmarks, allow_drawing=False)
-                elif not (wrists_crossed or is_crossed_now or unibeam_charging):
-                    # Render weapons conditionally (Suppressed if Unibeam is active/charging)
+                    pending_fire_start[handedness] = 0.0
+                    firing_armed[handedness] = False
+                else:
+                    # Render weapons conditionally
                     if pose_type == "REPULSOR":
                         any_repulsor_active = True
-                        repulsor.draw(frame, anchor, scale_multiplier)
+                        repulsor.draw(frame, anchor, scale_multiplier, theme=theme_mgr.get())
                         
                         # Find closest target to aim at
                         hx, hy = anchor
@@ -249,7 +238,7 @@ def main():
                         d_status, d_color = "ACTIVATED", (255, 255, 0) # Cyan
                         
                     elif pose_type == "SHIELD":
-                        shield.draw(frame, anchor, scale_multiplier)
+                        shield.draw(frame, anchor, scale_multiplier, theme=theme_mgr.get())
                         s_status, s_color = "DEPLOYED", (255, 255, 0) # Cyan
                         
                         # Evaluate Deflecting Lasers
@@ -271,91 +260,40 @@ def main():
         # --- POSE/CHEST TRACKING ---
         chest_pos = tracker.get_pose_data(frame_rgb)
 
-        # --- UNIBEAM LOGIC ---
-        # (is_crossed_now is pre-calculated above the hand loop)
-        chest_x = frame.shape[1] // 2
-        chest_y = int(frame.shape[0] * 0.8)
-
-        if chest_pos:
-            chest_x, chest_y = chest_pos
-
-        if tracking_data and len(tracking_data) == 2:
-            left_wrist, right_wrist = None, None
-            for hand_data in tracking_data:
-                handedness = hand_data[6]
-                if handedness == "Left":
-                    left_wrist = hand_data[3][0] # Landmark 0 is the wrist
-                else:
-                    right_wrist = hand_data[3][0]
+        # --- SCREENSHOT COUNTDOWN ---
+        if screenshot_active:
+            elapsed = time.time() - screenshot_countdown_start
+            remaining = 3.0 - elapsed
             
-            if left_wrist and right_wrist:
-                w, h = frame.shape[1], frame.shape[0]
-                
-                # If pose is not detection, FALL BACK to wrist midpoint for chest position
-                if not chest_pos:
-                    chest_x = int((left_wrist.x + right_wrist.x) * w / 2)
-                    chest_y = int((left_wrist.y + right_wrist.y) * h / 2) + 400
-
-
-
-        arc_reactor.anchor = (chest_x, chest_y)
-        charge_level = 0.0
-        
-        if time.time() < unibeam_cooldown_until:
-            u_status, u_color = "COOLING DOWN", (0, 150, 255) # Orange Warning
-            unibeam_charging = False
-            wrists_crossed = False
-        elif unibeam_charging:
-            # Autonomous charging phase
-            charge_duration = time.time() - unibeam_charge_start_time
-            charge_level = min(1.0, charge_duration / 1.0)
-            u_status, u_color = f"CHARGING... {int(charge_level*100)}%", (255, 255, 0)
-            
-            if charge_level >= 1.0:
-                # FIRE!
-                audio.play_fire()
-                unibeam_blasts.append(UnibeamBlast(chest_x, chest_y))
-                unibeam_cooldown_until = time.time() + 3.0
-                unibeam_charging = False
-                audio.stop_charge()
-                
-                if game.game_mode:
-                    # Full Screen Wipe!
-                    for drone in canvas.drones:
-                        canvas.explosions.append(Explosion(drone.anchor[0], drone.anchor[1], drone.color))
-                        game.score += 20
-                    canvas.drones = []
-        else:
-            # Handle Pulse Trigger
-            if is_crossed_now:
-                if not wrists_crossed:
-                    wrists_crossed = True
-                    u_status, u_color = "SYSTEM ARMED", (0, 255, 255) # Cyan
+            if remaining > 0:
+                # Draw large countdown number in the center of screen
+                countdown_num = int(remaining) + 1
+                text = str(countdown_num)
+                h_frame, w_frame = frame.shape[:2]
+                font_scale = 6.0
+                thickness = 12
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+                tx = (w_frame - text_size[0]) // 2
+                ty = (h_frame + text_size[1]) // 2
+                # Draw shadow then white text
+                cv2.putText(frame, text, (tx + 3, ty + 3), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 4, cv2.LINE_AA)
+                cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                # Draw a subtle ring animating inward
+                ring_radius = int(150 * (remaining / 3.0))
+                cv2.circle(frame, (w_frame // 2, h_frame // 2), ring_radius, (0, 255, 255), 3)
             else:
-                if wrists_crossed:
-                    # PULSE DETECTED (Crossed then Uncrossed)
-                    unibeam_charging = True
-                    unibeam_charge_start_time = time.time()
-                    audio.start_charge()
-                    wrists_crossed = False
-            
-            if len(unibeam_blasts) > 0:
-                u_status, u_color = "FIRING", (0, 0, 255)
-            elif not wrists_crossed and time.time() > unibeam_cooldown_until:
-                u_status, u_color = "STANDBY", (100, 100, 0)
-            elif wrists_crossed:
-                u_status, u_color = "SYSTEM ARMED", (0, 100, 255)
-
-
-        # Draw Reactor
-        arc_reactor.draw(frame, charge_level)
-        
-        # Draw Blasts
-        active_blasts = []
-        for blast in unibeam_blasts:
-            if blast.draw(frame):
-                active_blasts.append(blast)
-        unibeam_blasts = active_blasts
+                # CAPTURE!
+                os.makedirs("screenshots", exist_ok=True)
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filepath = f"screenshots/screenshot_{timestamp}.png"
+                cv2.imwrite(filepath, frame)
+                print(f"Screenshot saved: {filepath}")
+                
+                # Flash effect
+                frame[:] = (255, 255, 255)
+                
+                screenshot_active = False
+                screenshot_cooldown_until = time.time() + 5.0  # 5s cooldown
 
         #add text overlay
         if hud_font and title_font:
@@ -364,27 +302,27 @@ def main():
             
             # Using RGB colors for Pillow since we converted to RGB
             draw.text((30, 40), "HOLOGRAM AR SYSTEM", font=title_font, fill=(0, 255, 255))
-            draw.text((30, 90), f"REPULSOR SYS:   {r_status}", font=hud_font, fill=r_color[::-1])
-            draw.text((30, 130), f"UNIBEAM  SYS:   {u_status}", font=hud_font, fill=u_color[::-1])
-            draw.text((30, 170), f"DIAMOND  SYS:   {d_status}", font=hud_font, fill=d_color[::-1])
-            draw.text((30, 210), f"SHIELD   SYS:   {s_status}", font=hud_font, fill=s_color[::-1])
-            draw.text((30, 250), f"DRAW     MODE:  {dm_status}", font=hud_font, fill=dm_color[::-1])
-            draw.text((30, 290), f"SCALE    MODE:  {sm_status}", font=hud_font, fill=sm_color[::-1])
-            draw.text((30, 330), f"GAME     MODE:  {gm_status}", font=hud_font, fill=gm_color[::-1])
+            draw.text((30, 100), f"REPULSOR SYS:   {r_status}", font=hud_font, fill=r_color[::-1])
+            draw.text((30, 148), f"DIAMOND  SYS:   {d_status}", font=hud_font, fill=d_color[::-1])
+            draw.text((30, 196), f"SHIELD   SYS:   {s_status}", font=hud_font, fill=s_color[::-1])
+            draw.text((30, 244), f"DRAW     MODE:  {dm_status}", font=hud_font, fill=dm_color[::-1])
+            draw.text((30, 292), f"SCALE    MODE:  {sm_status}", font=hud_font, fill=sm_color[::-1])
+            draw.text((30, 340), f"GAME     MODE:  {gm_status}", font=hud_font, fill=gm_color[::-1])
+            draw.text((30, 388), f"ARMOR    SYS:   {theme_mgr.get_name()}", font=hud_font, fill=theme_mgr.get()['hud_accent'])
             
             # --- MISSION HUD OVERLAY ---
             game.draw_hud_pillow(draw, title_font, frame.shape)
             
             frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         else:
-            cv2.putText(frame, "HOLOGRAM AR SYSTEM", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(frame, f"REPULSOR SYS:   {r_status}", (30, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, r_color, 2, cv2.LINE_AA)
-            cv2.putText(frame, f"UNIBEAM  SYS:   {u_status}", (30, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, u_color, 2, cv2.LINE_AA)
-            cv2.putText(frame, f"DIAMOND  SYS:   {d_status}", (30, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, d_color, 2, cv2.LINE_AA)
-            cv2.putText(frame, f"SHIELD   SYS:   {s_status}", (30, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.8, s_color, 2, cv2.LINE_AA)
-            cv2.putText(frame, f"DRAW     MODE:  {dm_status}", (30, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.8, dm_color, 2, cv2.LINE_AA)
-            cv2.putText(frame, f"SCALE    MODE:  {sm_status}", (30, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.8, sm_color, 2, cv2.LINE_AA)
-            cv2.putText(frame, f"GAME     MODE:  {gm_status}", (30, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.8, gm_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, "HOLOGRAM AR SYSTEM", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"REPULSOR SYS:   {r_status}", (30, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, r_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"DIAMOND  SYS:   {d_status}", (30, 158), cv2.FONT_HERSHEY_SIMPLEX, 1.0, d_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"SHIELD   SYS:   {s_status}", (30, 206), cv2.FONT_HERSHEY_SIMPLEX, 1.0, s_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"DRAW     MODE:  {dm_status}", (30, 254), cv2.FONT_HERSHEY_SIMPLEX, 1.0, dm_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"SCALE    MODE:  {sm_status}", (30, 302), cv2.FONT_HERSHEY_SIMPLEX, 1.0, sm_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"GAME     MODE:  {gm_status}", (30, 350), cv2.FONT_HERSHEY_SIMPLEX, 1.0, gm_color, 2, cv2.LINE_AA)
+            cv2.putText(frame, f"ARMOR    SYS:   {theme_mgr.get_name()}", (30, 398), cv2.FONT_HERSHEY_SIMPLEX, 1.0, theme_mgr.get()['hud_accent'], 2, cv2.LINE_AA)
             
             # --- MISSION HUD OVERLAY ---
             game.draw_hud_cv2(frame)
@@ -408,6 +346,12 @@ def main():
                 canvas.stroke_path = []
         elif key == ord('g'):
             game.toggle_game_mode(canvas)
+        elif key == ord('t'):
+            theme_mgr.cycle()
+        elif key == ord('p'):
+            if not screenshot_active and time.time() > screenshot_cooldown_until:
+                screenshot_active = True
+                screenshot_countdown_start = time.time()
 
     audio.cleanup()
     cap.release()

@@ -29,7 +29,7 @@ class Repulsor:
                 spark.life = random.randint(10, 20)
                 break
 
-    def draw (self, frame, anchor, scale_multiplier):
+    def draw (self, frame, anchor, scale_multiplier, theme=None):
         # Reduced physical bobbing/pulsing
         x, y = anchor 
         pulse = 1.0 + 0.02 * math.sin(time.time() * 5)
@@ -38,12 +38,16 @@ class Repulsor:
         # Color intensity pulse for the glow effect (oscillates 0-255)
         glow = int(127 + 128 * math.sin(time.time() * 15))
         
-        # BGR Format: Cyan is (255, 255, 0), White is (255, 255, 255)
-        # Adding the glow to the Red channel fades it between Cyan and White
-        glow_color = (255, 255, glow)
+        # Use theme colors or defaults
+        base_glow = theme["repulsor_glow"] if theme else (255, 255, 0)
+        core_color = theme["repulsor_core"] if theme else (255, 255, 255)
+        spark_color = theme["repulsor_spark"] if theme else (0, 165, 255)
+        
+        # Adding the glow to one channel fades between base and white
+        glow_color = (base_glow[0], base_glow[1], min(255, base_glow[2] + glow))
 
         # Faint outer aura glow
-        cv2.circle(frame, (x, y), int(current_radius * 1.15), (255, 255, 0), 2)
+        cv2.circle(frame, (x, y), int(current_radius * 1.15), base_glow, 2)
 
         # Outer ring
         cv2.circle(frame, (x,y), current_radius, glow_color, 4)
@@ -52,7 +56,7 @@ class Repulsor:
         cv2.circle(frame, (x, y), int(current_radius * 0.75), glow_color, 2)
         
         # Inner white-hot core
-        cv2.circle(frame, (x, y), int(current_radius * 0.4), (255, 255, 255), -1)
+        cv2.circle(frame, (x, y), int(current_radius * 0.4), core_color, -1)
 
         # Emit a few sparks every frame
         sparks_to_spawn = int(2 * scale_multiplier)
@@ -70,4 +74,4 @@ class Repulsor:
                 if spark.life <= 0:
                     spark.active = False
                 else:
-                    cv2.circle(frame, (int(spark.x), int(spark.y)), 4, (0, 165, 255), -1)
+                    cv2.circle(frame, (int(spark.x), int(spark.y)), 4, spark_color, -1)

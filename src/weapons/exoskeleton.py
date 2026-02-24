@@ -13,13 +13,13 @@ class Exoskeleton:
         #main plate on back
         self.palm_path = [0, 5, 9, 13, 17]
         
-    def draw (self, frame, hand_landmarks):
+    def draw (self, frame, hand_landmarks, theme=None):
         #draw semi-transparent glove over hand
 
-        # Darker Iron Man red
-        base_red = (0, 0, 110)
-        edge_red = (0, 0, 150)
-        gold = (0, 200, 255)
+        # Use theme colors or defaults
+        base_red = theme["exo_base"] if theme else (0, 0, 110)
+        edge_red = theme["exo_edge"] if theme else (0, 0, 150)
+        gold = theme["exo_accent"] if theme else (0, 200, 255)
 
         h, w, _ = frame.shape
         overlay = np.zeros((h, w, 3), dtype=np.uint8)
@@ -64,4 +64,7 @@ class Exoskeleton:
             # Gold joint at fingertip
             cv2.circle(overlay, points[path[-1]], 14, gold, -1)
 
-        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+        # Blend overlay onto frame only where the overlay has content (no darkening)
+        mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY) > 0
+        blended = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        frame[mask] = blended[mask]

@@ -10,3 +10,8 @@ venv/
 
 # AR Assets
 src/hand_landmarker.task
+src/pose_landmarker_lite.task
+
+# Screenshots
+screenshots/
+
